@@ -1,0 +1,62 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug cli with test_input.csv",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=csv-ingestor",
+                    "--package=cli"
+                ],
+                "filter": {
+                    "name": "csv-ingestor",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "test_input.csv"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Run all tests in tests crate",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--package=tests",
+                    "--tests"
+                ],
+                "filter": {
+                    "kind": "test"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Run all unit tests",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--workspace",
+                    "--lib",
+                    "--bins"
+                ],
+                "filter": {
+                    "kind": "lib"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

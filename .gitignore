@@ -1,0 +1,36 @@
+# Cargo build artifacts
+/target/
+**/target/
+
+# Backup files emitted by rustfmt
+**/*.rs.bk
+
+# MSVC debug info
+*.pdb
+
+# Profiling / coverage
+*.profraw
+*.profdata
+flamegraph.svg
+perf.data*
+tarpaulin-report.html
+cobertura.xml
+
+# Editor / OS
+.idea/
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# rust-analyzer
+rust-project.json
+
+# Local env overrides
+.env
+.env.local

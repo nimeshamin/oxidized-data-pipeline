@@ -1,0 +1,17 @@
+[package]
+name = "tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cli = { path = "../cli" }
+transaction-processor = { path = "../transaction-processor" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+peak_alloc = "0.2"
