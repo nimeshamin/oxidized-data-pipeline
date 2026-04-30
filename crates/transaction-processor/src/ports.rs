@@ -75,5 +75,6 @@ pub trait Storage: Send + Sync {
     async fn get_account(&self, client_id: u16) -> anyhow::Result<Account>;
     async fn find_transaction(&self, tx_id: u32) -> anyhow::Result<Transaction>;
     async fn find_disputed_transaction(&self, tx_id: u32) -> anyhow::Result<Transaction>;
+    async fn has_transaction_been_processed(&self, tx_id: u32) -> anyhow::Result<bool>;
     async fn all_accounts(&self, page: usize, page_size: usize) -> anyhow::Result<Vec<Account>>;
 }

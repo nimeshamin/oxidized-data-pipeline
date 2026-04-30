@@ -4,9 +4,28 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
-    ports::{Account, Storage},
+    ports::{Account, Storage, TxType},
     Transaction,
 };
+
+/// A Transaction that is guaranteed to be a Deposit or Withdrawal.
+/// Lifecycle messages (Dispute/Resolve/Chargeback) are rejected.
+#[derive(Debug, Clone)]
+pub struct MonetaryTransaction(pub Transaction);
+
+impl TryFrom<Transaction> for MonetaryTransaction {
+    type Error = anyhow::Error;
+
+    fn try_from(tx: Transaction) -> Result<Self, Self::Error> {
+        match tx.tx_type {
+            TxType::Deposit | TxType::Withdrawal => Ok(MonetaryTransaction(tx)),
+            _ => Err(anyhow::anyhow!(
+                "only Deposit and Withdrawal transactions can be stored as monetary transactions, got {:?}",
+                tx.tx_type
+            )),
+        }
+    }
+}
 
 /// In-memory storage adapter.
 #[derive(Default)]
@@ -82,7 +101,8 @@ impl LocalMemoryStorage {
             .clone()
     }
 
-    pub async fn add_transaction(&self, tx: Transaction) {
+    pub async fn add_transaction(&self, tx: MonetaryTransaction) {
+        let tx = tx.0;
         let mut transactions = self.transactions.lock().await;
         transactions.insert(tx.tx_id, tx);
     }
@@ -96,7 +116,8 @@ impl Storage for LocalMemoryStorage {
         account: Account,
     ) -> anyhow::Result<()> {
         self.update(account).await;
-        self.add_transaction(tx).await;
+        self.add_transaction(MonetaryTransaction::try_from(tx)?)
+            .await;
         Ok(())
     }
 
@@ -108,7 +129,6 @@ impl Storage for LocalMemoryStorage {
         self.update(account).await;
         self.transfer_from_transactions_to_disputed(tx.tx_id)
             .await?;
-        self.add_transaction(tx).await;
         Ok(())
     }
 
@@ -120,7 +140,6 @@ impl Storage for LocalMemoryStorage {
         self.update(account).await;
         self.transfer_from_disputed_to_transactions(tx.tx_id)
             .await?;
-        self.add_transaction(tx).await;
         Ok(())
     }
 
@@ -131,7 +150,6 @@ impl Storage for LocalMemoryStorage {
     ) -> anyhow::Result<()> {
         self.update(account).await;
         self.transfer_from_disputed_to_reverted(tx.tx_id).await?;
-        self.add_transaction(tx).await;
         Ok(())
     }
 
@@ -153,6 +171,15 @@ impl Storage for LocalMemoryStorage {
             .get(&tx_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Disputed transaction not found"))
+    }
+
+    async fn has_transaction_been_processed(&self, tx_id: u32) -> anyhow::Result<bool> {
+        let transactions = self.transactions.lock().await;
+        let disputed_transactions = self.disputed_transactions.lock().await;
+        let reverted_transactions = self.reverted_transactions.lock().await;
+        Ok(transactions.contains_key(&tx_id)
+            || disputed_transactions.contains_key(&tx_id)
+            || reverted_transactions.contains_key(&tx_id))
     }
 
     async fn all_accounts(&self, page: usize, page_size: usize) -> anyhow::Result<Vec<Account>> {

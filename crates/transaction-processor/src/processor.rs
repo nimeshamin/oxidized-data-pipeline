@@ -94,6 +94,21 @@ async fn worker_loop(
 }
 
 async fn try_process_transaction(tx: Transaction, storage: Arc<dyn Storage>) -> anyhow::Result<()> {
+    // Skip monetary transactions that have already been processed. We are assuming that the lifecycle
+    // types won't have duplicates where a a duplicate dispute comes in after a resolve. We need to
+    // update the incoming Transaction model to be able to dedupe lifecycle events coming from the
+    // source to know which lifecycle events are actually dupes.
+    if tx.tx_type == crate::ports::TxType::Deposit || tx.tx_type == crate::ports::TxType::Withdrawal
+    {
+        if storage.has_transaction_been_processed(tx.tx_id).await? {
+            tracing::info!(
+                tx_id = tx.tx_id,
+                "transaction has already been processed, skipping"
+            );
+            return Ok(());
+        }
+    }
+
     // First, get existing client account state from storage
     let account = storage.get_account(tx.client_id).await?;
 
@@ -597,5 +612,91 @@ mod tests {
         assert_eq!(after.held, before.held - 200.0);
         assert_eq!(after.total, before.total - 200.0);
         assert!(after.locked);
+    }
+
+    // -------------------------------------------------------------------------
+    // Idempotency
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn duplicate_withdrawals_and_deposits_are_processed_idempotently() {
+        let storage = Arc::new(LocalMemoryStorage::new());
+        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
+        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
+        run(&storage, make_tx(TxType::Withdrawal, 1, 2, 30.0)).await;
+        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
+        run(&storage, make_tx(TxType::Withdrawal, 1, 2, 30.0)).await;
+        run(&storage, make_tx(TxType::Withdrawal, 1, 2, 30.0)).await;
+
+        let account = storage.get_account(1).await.unwrap();
+        assert_eq!(account.available, 70.0);
+        assert_eq!(account.total, 70.0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_disputes_are_processed_idempotently() {
+        let storage = Arc::new(LocalMemoryStorage::new());
+        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
+        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
+
+        let after_first = storage.get_account(1).await.unwrap();
+        assert_eq!(after_first.available, 0.0);
+        assert_eq!(after_first.held, 100.0);
+        assert_eq!(after_first.total, 100.0);
+
+        // Second and third duplicate disputes — each errors at storage level and is swallowed
+        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
+        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
+
+        let after_duplicates = storage.get_account(1).await.unwrap();
+        assert_eq!(after_duplicates.available, after_first.available);
+        assert_eq!(after_duplicates.held, after_first.held);
+        assert_eq!(after_duplicates.total, after_first.total);
+    }
+
+    #[tokio::test]
+    async fn duplicate_resolves_are_processed_idempotently() {
+        let storage = Arc::new(LocalMemoryStorage::new());
+        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
+        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
+        run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
+
+        let after_first = storage.get_account(1).await.unwrap();
+        assert_eq!(after_first.available, 100.0);
+        assert_eq!(after_first.held, 0.0);
+        assert_eq!(after_first.total, 100.0);
+
+        // Duplicate resolves — tx_id=1 is no longer in disputed_transactions
+        run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
+        run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
+
+        let after_duplicates = storage.get_account(1).await.unwrap();
+        assert_eq!(after_duplicates.available, after_first.available);
+        assert_eq!(after_duplicates.held, after_first.held);
+        assert_eq!(after_duplicates.total, after_first.total);
+    }
+
+    #[tokio::test]
+    async fn duplicate_chargebacks_are_processed_idempotently() {
+        let storage = Arc::new(LocalMemoryStorage::new());
+        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
+        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
+        run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
+
+        let after_first = storage.get_account(1).await.unwrap();
+        assert_eq!(after_first.available, 0.0);
+        assert_eq!(after_first.held, 0.0);
+        assert_eq!(after_first.total, 0.0);
+        assert!(after_first.locked);
+
+        // Duplicate chargebacks — tx_id=1 is no longer in disputed_transactions
+        run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
+        run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
+
+        let after_duplicates = storage.get_account(1).await.unwrap();
+        assert_eq!(after_duplicates.available, after_first.available);
+        assert_eq!(after_duplicates.held, after_first.held);
+        assert_eq!(after_duplicates.total, after_first.total);
+        assert!(after_duplicates.locked);
     }
 }
