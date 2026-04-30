@@ -69,11 +69,11 @@ fn output_csv_header() {
 fn output_formatted_accounts(accounts: &[transaction_processor::ports::Account]) {
     for account in accounts {
         println!(
-            "{},{:.4},{:.4},{:.4},{}",
+            "{},{},{},{},{}",
             account.client_id,
-            account.available,
-            account.held,
-            account.total,
+            account.available.round_dp(4).normalize().to_string(),
+            account.held.round_dp(4).normalize().to_string(),
+            account.total.round_dp(4).normalize().to_string(),
             account.locked
         );
     }
@@ -81,7 +81,5 @@ fn output_formatted_accounts(accounts: &[transaction_processor::ports::Account])
 
 fn init_tracing(level: Level) {
     let filter = EnvFilter::new(level.as_str());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }

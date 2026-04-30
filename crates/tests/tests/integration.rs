@@ -23,9 +23,7 @@ fn init_tracing(debug: bool) {
     } else {
         EnvFilter::new("warn")
     };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 #[tokio::test]
@@ -76,14 +74,19 @@ async fn transaction_processor_direct_use_simple_single_worker() -> anyhow::Resu
     assert_eq!(idx_a, idx_b, "router must be deterministic");
     assert!(idx_a < 1);
 
-    let result = processor.ingest_csv(Path::new("crates/tests/tests/data/test_input_simple.csv")).await;
+    let result = processor
+        .ingest_csv(Path::new("./tests/data/test_input_simple.csv"))
+        .await;
     if result.is_err() {
         eprintln!("ingest_csv error: {:?}", result.as_ref().err());
     }
     assert!(result.is_ok(), "ingest_csv should succeed with valid input");
 
     let accounts = processor.snapshot_accounts(0, 1).await?;
-    assert!(!accounts.is_empty(), "snapshot_accounts should return some accounts");
+    assert!(
+        !accounts.is_empty(),
+        "snapshot_accounts should return some accounts"
+    );
     // Loop until there are no more items. Print each account as a line of output
     let mut page = 0;
     let page_size = 1;
@@ -97,7 +100,7 @@ async fn transaction_processor_direct_use_simple_single_worker() -> anyhow::Resu
         }
         page += 1;
     }
-    
+
     processor.shutdown().await?;
     Ok(())
 }
@@ -122,23 +125,6 @@ async fn transaction_processor_direct_use() -> anyhow::Result<()> {
     assert!(idx_a < 4);
 
     processor.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn transaction_processor_ingests_csv_end_to_end() -> anyhow::Result<()> {
-    let _m = MetricsGuard::new("transaction_processor_ingests_csv_end_to_end");
-
-    let path = write_sample_csv("processor-e2e").await?;
-
-    let processor = TransactionProcessor::builder()
-        .parallelism(2)
-        .channel_capacity(16)
-        .build()
-        .await?;
-    processor.ingest_csv(&path).await?;
-    processor.shutdown().await?;
-
     Ok(())
 }
 

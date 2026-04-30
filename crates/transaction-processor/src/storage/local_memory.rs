@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -92,9 +93,9 @@ impl LocalMemoryStorage {
             .entry(client_id)
             .or_insert_with(|| Account {
                 client_id,
-                available: 0.0,
-                held: 0.0,
-                total: 0.0,
+                available: Decimal::ZERO,
+                held: Decimal::ZERO,
+                total: Decimal::ZERO,
                 locked: false,
             })
             .clone()

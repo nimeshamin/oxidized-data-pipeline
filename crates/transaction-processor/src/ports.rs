@@ -5,6 +5,7 @@
 //! of any specific I/O implementation.
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -44,16 +45,16 @@ pub struct Transaction {
     pub tx_type: TxType,
     pub client_id: u16,
     pub tx_id: u32,
-    pub amount: f64,
+    pub amount: Decimal,
 }
 
 /// Client account state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub client_id: u16,
-    pub available: f64,
-    pub held: f64,
-    pub total: f64,
+    pub available: Decimal,
+    pub held: Decimal,
+    pub total: Decimal,
     pub locked: bool,
 }
 

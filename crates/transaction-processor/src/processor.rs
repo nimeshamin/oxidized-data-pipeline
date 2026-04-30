@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -150,7 +151,7 @@ async fn try_process_transaction(tx: Transaction, storage: Arc<dyn Storage>) -> 
         // A deposit is a credit to the client's asset account, meaning it should increase the available and
         // total funds of the client account
         crate::ports::TxType::Deposit => {
-            if tx.amount < 0.0 {
+            if tx.amount < Decimal::ZERO {
                 // Negative deposit amount, return an error
                 return Err(anyhow::anyhow!(
                     crate::ports::TransactionError::InvalidTransactionAmount
@@ -171,7 +172,7 @@ async fn try_process_transaction(tx: Transaction, storage: Arc<dyn Storage>) -> 
         // A withdraw is a debit to the client's asset account, meaning it should decrease the available and
         // total funds of the client account
         crate::ports::TxType::Withdrawal => {
-            if tx.amount < 0.0 {
+            if tx.amount < Decimal::ZERO {
                 // Negative withdrawal amount, return an error
                 return Err(anyhow::anyhow!(
                     crate::ports::TransactionError::InvalidTransactionAmount
@@ -335,6 +336,8 @@ impl TransactionProcessor {
 mod tests {
     use std::sync::Arc;
 
+    use rust_decimal::Decimal;
+
     use super::process_transaction;
     use crate::ports::{Storage, Transaction, TxType};
     use crate::storage::local_memory::LocalMemoryStorage;
@@ -344,8 +347,12 @@ mod tests {
             tx_type,
             client_id,
             tx_id,
-            amount,
+            amount: Decimal::try_from(amount).unwrap(),
         }
+    }
+
+    fn d(v: f64) -> Decimal {
+        Decimal::try_from(v).unwrap()
     }
 
     /// Convenience wrapper: run a transaction against storage, panicking on unexpected errors.
@@ -368,9 +375,9 @@ mod tests {
         run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 100.0);
-        assert_eq!(account.total, 100.0);
-        assert_eq!(account.held, 0.0);
+        assert_eq!(account.available, d(100.0));
+        assert_eq!(account.total, d(100.0));
+        assert_eq!(account.held, Decimal::ZERO);
         assert!(!account.locked);
     }
 
@@ -380,8 +387,8 @@ mod tests {
         run(&storage, make_tx(TxType::Deposit, 1, 1, -50.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 0.0);
-        assert_eq!(account.total, 0.0);
+        assert_eq!(account.available, Decimal::ZERO);
+        assert_eq!(account.total, Decimal::ZERO);
     }
 
     #[tokio::test]
@@ -398,8 +405,8 @@ mod tests {
 
         let account = storage.get_account(1).await.unwrap();
         assert!(account.locked);
-        assert_eq!(account.available, 50.0);
-        assert_eq!(account.total, 50.0);
+        assert_eq!(account.available, d(50.0));
+        assert_eq!(account.total, d(50.0));
     }
 
     // -------------------------------------------------------------------------
@@ -413,9 +420,9 @@ mod tests {
         run(&storage, make_tx(TxType::Withdrawal, 1, 2, 40.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 60.0);
-        assert_eq!(account.total, 60.0);
-        assert_eq!(account.held, 0.0);
+        assert_eq!(account.available, d(60.0));
+        assert_eq!(account.total, d(60.0));
+        assert_eq!(account.held, Decimal::ZERO);
     }
 
     #[tokio::test]
@@ -425,8 +432,8 @@ mod tests {
         run(&storage, make_tx(TxType::Withdrawal, 1, 2, -10.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 100.0);
-        assert_eq!(account.total, 100.0);
+        assert_eq!(account.available, d(100.0));
+        assert_eq!(account.total, d(100.0));
     }
 
     #[tokio::test]
@@ -436,8 +443,8 @@ mod tests {
         run(&storage, make_tx(TxType::Withdrawal, 1, 2, 100.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 50.0);
-        assert_eq!(account.total, 50.0);
+        assert_eq!(account.available, d(50.0));
+        assert_eq!(account.total, d(50.0));
     }
 
     #[tokio::test]
@@ -470,9 +477,9 @@ mod tests {
         run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 0.0);
-        assert_eq!(account.held, 100.0);
-        assert_eq!(account.total, 100.0);
+        assert_eq!(account.available, Decimal::ZERO);
+        assert_eq!(account.held, d(100.0));
+        assert_eq!(account.total, d(100.0));
         assert!(!account.locked);
     }
 
@@ -485,9 +492,9 @@ mod tests {
         run(&storage, make_tx(TxType::Dispute, 2, 1, 0.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 100.0);
-        assert_eq!(account.held, 0.0);
-        assert_eq!(account.total, 100.0);
+        assert_eq!(account.available, d(100.0));
+        assert_eq!(account.held, Decimal::ZERO);
+        assert_eq!(account.total, d(100.0));
     }
 
     #[tokio::test]
@@ -500,9 +507,9 @@ mod tests {
         run(&storage, make_tx(TxType::Dispute, 1, 2, 0.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 60.0);
-        assert_eq!(account.held, 0.0);
-        assert_eq!(account.total, 60.0);
+        assert_eq!(account.available, d(60.0));
+        assert_eq!(account.held, Decimal::ZERO);
+        assert_eq!(account.total, d(60.0));
     }
 
     #[tokio::test]
@@ -522,8 +529,8 @@ mod tests {
         run(&storage, make_tx(TxType::Dispute, 1, 2, 0.0)).await;
 
         let after = storage.get_account(1).await.unwrap();
-        assert_eq!(after.available, before.available - 200.0);
-        assert_eq!(after.held, before.held + 200.0);
+        assert_eq!(after.available, before.available - d(200.0));
+        assert_eq!(after.held, before.held + d(200.0));
         assert_eq!(after.total, before.total);
         assert!(after.locked);
     }
@@ -540,9 +547,9 @@ mod tests {
         run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 100.0);
-        assert_eq!(account.held, 0.0);
-        assert_eq!(account.total, 100.0);
+        assert_eq!(account.available, d(100.0));
+        assert_eq!(account.held, Decimal::ZERO);
+        assert_eq!(account.total, d(100.0));
         assert!(!account.locked);
     }
 
@@ -557,9 +564,9 @@ mod tests {
 
         let account = storage.get_account(1).await.unwrap();
         // Funds should remain held
-        assert_eq!(account.available, 0.0);
-        assert_eq!(account.held, 100.0);
-        assert_eq!(account.total, 100.0);
+        assert_eq!(account.available, Decimal::ZERO);
+        assert_eq!(account.held, d(100.0));
+        assert_eq!(account.total, d(100.0));
     }
 
     #[tokio::test]
@@ -580,8 +587,8 @@ mod tests {
         run(&storage, make_tx(TxType::Resolve, 1, 2, 0.0)).await;
 
         let after = storage.get_account(1).await.unwrap();
-        assert_eq!(after.available, before.available + 100.0);
-        assert_eq!(after.held, before.held - 100.0);
+        assert_eq!(after.available, before.available + d(100.0));
+        assert_eq!(after.held, before.held - d(100.0));
         assert_eq!(after.total, before.total);
         assert!(after.locked);
     }
@@ -598,9 +605,9 @@ mod tests {
         run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 0.0);
-        assert_eq!(account.held, 0.0);
-        assert_eq!(account.total, 0.0);
+        assert_eq!(account.available, Decimal::ZERO);
+        assert_eq!(account.held, Decimal::ZERO);
+        assert_eq!(account.total, Decimal::ZERO);
         assert!(account.locked);
     }
 
@@ -614,8 +621,8 @@ mod tests {
         run(&storage, make_tx(TxType::Chargeback, 2, 1, 0.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.held, 100.0);
-        assert_eq!(account.total, 100.0);
+        assert_eq!(account.held, d(100.0));
+        assert_eq!(account.total, d(100.0));
         assert!(!account.locked);
     }
 
@@ -636,8 +643,8 @@ mod tests {
         run(&storage, make_tx(TxType::Chargeback, 1, 2, 0.0)).await;
 
         let after = storage.get_account(1).await.unwrap();
-        assert_eq!(after.held, before.held - 200.0);
-        assert_eq!(after.total, before.total - 200.0);
+        assert_eq!(after.held, before.held - d(200.0));
+        assert_eq!(after.total, before.total - d(200.0));
         assert!(after.locked);
     }
 
@@ -656,8 +663,8 @@ mod tests {
         run(&storage, make_tx(TxType::Withdrawal, 1, 2, 30.0)).await;
 
         let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, 70.0);
-        assert_eq!(account.total, 70.0);
+        assert_eq!(account.available, d(70.0));
+        assert_eq!(account.total, d(70.0));
     }
 
     #[tokio::test]
@@ -667,9 +674,9 @@ mod tests {
         run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
 
         let after_first = storage.get_account(1).await.unwrap();
-        assert_eq!(after_first.available, 0.0);
-        assert_eq!(after_first.held, 100.0);
-        assert_eq!(after_first.total, 100.0);
+        assert_eq!(after_first.available, Decimal::ZERO);
+        assert_eq!(after_first.held, d(100.0));
+        assert_eq!(after_first.total, d(100.0));
 
         // Second and third duplicate disputes — each errors at storage level and is swallowed
         run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
@@ -689,9 +696,9 @@ mod tests {
         run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
 
         let after_first = storage.get_account(1).await.unwrap();
-        assert_eq!(after_first.available, 100.0);
-        assert_eq!(after_first.held, 0.0);
-        assert_eq!(after_first.total, 100.0);
+        assert_eq!(after_first.available, d(100.0));
+        assert_eq!(after_first.held, Decimal::ZERO);
+        assert_eq!(after_first.total, d(100.0));
 
         // Duplicate resolves — tx_id=1 is no longer in disputed_transactions
         run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
@@ -711,9 +718,9 @@ mod tests {
         run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
 
         let after_first = storage.get_account(1).await.unwrap();
-        assert_eq!(after_first.available, 0.0);
-        assert_eq!(after_first.held, 0.0);
-        assert_eq!(after_first.total, 0.0);
+        assert_eq!(after_first.available, Decimal::ZERO);
+        assert_eq!(after_first.held, Decimal::ZERO);
+        assert_eq!(after_first.total, Decimal::ZERO);
         assert!(after_first.locked);
 
         // Duplicate chargebacks — tx_id=1 is no longer in disputed_transactions

@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive"] }
 csv-async = { version = "1", features = ["tokio"] }
 futures = "0.3"
 num_cpus = "1"
+rust_decimal = { version = "1.41", features = ["serde-str"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }

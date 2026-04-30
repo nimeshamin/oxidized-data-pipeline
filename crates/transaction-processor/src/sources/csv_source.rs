@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use csv_async::{AsyncReaderBuilder, Error as CsvError, ErrorKind};
 use futures::StreamExt;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::fs::File;
 use tokio::sync::mpsc;
@@ -21,7 +22,7 @@ struct CsvTransaction {
     #[serde(rename = "tx", default)]
     tx_id: u32,
     #[serde(default)]
-    amount: Option<f64>,
+    amount: Option<Decimal>,
 }
 
 impl CsvTransaction {
@@ -30,7 +31,7 @@ impl CsvTransaction {
             tx_type: self.tx_type,
             client_id: self.client_id,
             tx_id: self.tx_id,
-            amount: self.amount.unwrap_or(0.0),
+            amount: self.amount.unwrap_or(Decimal::ZERO),
         }
     }
 }
@@ -88,9 +89,21 @@ fn is_ignorable_error(err: &CsvError) -> bool {
             let line = err.position().map(|pos| pos.line()).unwrap_or(0);
             let field = de_err.field();
             let kind = de_err.kind();
-            // TODO: Tighten this a bit more to ensure only certain errors for specific fields
-            // TODO: are ignored. For now, we just log all deserialization errors and ignore them.
             tracing::debug!(line, field, kind = ?kind, "CSV row deserialization error");
+            return true;
+        }
+        ErrorKind::UnequalLengths {
+            pos,
+            expected_len,
+            len,
+        } => {
+            let row = pos.as_ref().map(|p| p.line()).unwrap_or(0);
+            tracing::debug!(
+                row,
+                expected_len,
+                len,
+                "CSV row with unexpected number of fields"
+            );
             return true;
         }
         // All other error kinds are not ignorable
