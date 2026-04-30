@@ -24,6 +24,29 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Debug transaction_processor_direct_use_simple_single_worker",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--package=tests",
+                    "--test",
+                    "integration"
+                ],
+                "filter": {
+                    "name": "integration",
+                    "kind": "test"
+                }
+            },
+            "args": [
+                "transaction_processor_direct_use_simple_single_worker",
+                "--nocapture"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Run all tests in tests crate",
             "cargo": {
                 "args": [
@@ -47,11 +70,11 @@
                 "args": [
                     "test",
                     "--no-run",
-                    "--workspace",
-                    "--lib",
-                    "--bins"
+                    "--package=transaction-processor",
+                    "--lib"
                 ],
                 "filter": {
+                    "name": "transaction_processor",
                     "kind": "lib"
                 }
             },

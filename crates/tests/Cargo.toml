@@ -15,3 +15,4 @@ transaction-processor = { path = "../transaction-processor" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 peak_alloc = "0.2"
+tracing-subscriber.workspace = true

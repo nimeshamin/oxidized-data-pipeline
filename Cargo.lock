@@ -572,6 +572,7 @@ dependencies = [
  "cli",
  "peak_alloc",
  "tokio",
+ "tracing-subscriber",
  "transaction-processor",
 ]
 

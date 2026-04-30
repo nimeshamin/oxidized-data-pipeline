@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::Parser;
+use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug, Clone)]
@@ -14,19 +15,40 @@ pub struct Cli {
     /// Input CSV filename (positional, required).
     pub input: PathBuf,
 
-    /// Set log level to debug (default is warn).
+    /// Enable tracing output.
     #[arg(long, default_value_t = false)]
-    pub debug: bool,
+    pub tracing: bool,
+
+    /// Log level when --tracing is enabled (trace, debug, info, warn, error).
+    #[arg(long, default_value_t = Level::INFO, requires = "tracing")]
+    pub log_level: Level,
 }
 
 pub async fn run(args: Cli) -> anyhow::Result<()> {
-    init_tracing(args.debug);
+    if args.tracing {
+        init_tracing(args.log_level);
+    }
     tracing::debug!(input = ?args.input, "starting csv-ingestor");
 
     let processor = transaction_processor::TransactionProcessor::builder()
         .build()
         .await?;
     processor.ingest_csv(&args.input).await?;
+
+    // Output accounts in CSV format to stdout, bypassing any structured logging that might be enabled
+    output_csv_header();
+
+    let mut page = 0;
+    let page_size = 512;
+    loop {
+        let accounts = processor.snapshot_accounts(page, page_size).await?;
+        if accounts.is_empty() {
+            break;
+        }
+        output_formatted_accounts(&accounts);
+        page += 1;
+    }
+
     processor.shutdown().await?;
     Ok(())
 }
@@ -40,12 +62,25 @@ where
     run(args).await
 }
 
-fn init_tracing(debug: bool) {
-    let filter = if debug {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::new("warn")
-    };
+fn output_csv_header() {
+    println!("client,available,held,total,locked");
+}
+
+fn output_formatted_accounts(accounts: &[transaction_processor::ports::Account]) {
+    for account in accounts {
+        println!(
+            "{},{:.4},{:.4},{:.4},{}",
+            account.client_id,
+            account.available,
+            account.held,
+            account.total,
+            account.locked
+        );
+    }
+}
+
+fn init_tracing(level: Level) {
+    let filter = EnvFilter::new(level.as_str());
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .try_init();
