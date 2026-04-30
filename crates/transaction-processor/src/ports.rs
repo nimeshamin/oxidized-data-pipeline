@@ -8,6 +8,24 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+/// Used by process_transaction to decide whether an error should be
+/// silently swallowed (e.g. a lifecycle event referencing a non-existent or
+/// already-processed transaction) or propagated to the caller.
+#[derive(Debug, thiserror::Error)]
+pub enum TransactionError {
+    /// The referenced transaction could not be found in any storage bucket.
+    #[error("transaction not found")]
+    NotFound,
+    #[error("insufficient available funds")]
+    InsufficientFunds,
+    #[error("invalid or negative amount specified for transaction")]
+    InvalidTransactionAmount,
+    #[error("only Deposit and Withdrawal transactions can be stored as monetary transactions")]
+    InvalidTransactionStorageAttempt,
+    #[error("expected transaction for ACID update not found or invalid. Logic, data corruption or race condition.")]
+    StoreCorruptionDetected,
+}
+
 /// Type of tx coming in from the source.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]

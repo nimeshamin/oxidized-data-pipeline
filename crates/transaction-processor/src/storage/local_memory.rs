@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
-    ports::{Account, Storage, TxType},
+    ports::{Account, Storage, TransactionError, TxType},
     Transaction,
 };
 
@@ -20,8 +20,7 @@ impl TryFrom<Transaction> for MonetaryTransaction {
         match tx.tx_type {
             TxType::Deposit | TxType::Withdrawal => Ok(MonetaryTransaction(tx)),
             _ => Err(anyhow::anyhow!(
-                "only Deposit and Withdrawal transactions can be stored as monetary transactions, got {:?}",
-                tx.tx_type
+                TransactionError::InvalidTransactionStorageAttempt
             )),
         }
     }
@@ -61,7 +60,7 @@ impl LocalMemoryStorage {
             disputed_transactions.insert(tx_id, tx);
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Transaction not found"))
+            Err(anyhow::anyhow!(TransactionError::StoreCorruptionDetected))
         }
     }
 
@@ -72,7 +71,7 @@ impl LocalMemoryStorage {
             transactions.insert(tx_id, tx);
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Transaction not found"))
+            Err(anyhow::anyhow!(TransactionError::StoreCorruptionDetected))
         }
     }
 
@@ -83,7 +82,7 @@ impl LocalMemoryStorage {
             reverted_transactions.insert(tx_id, tx);
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Transaction not found"))
+            Err(anyhow::anyhow!(TransactionError::StoreCorruptionDetected))
         }
     }
 
@@ -162,7 +161,7 @@ impl Storage for LocalMemoryStorage {
         transactions
             .get(&tx_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Transaction not found"))
+            .ok_or_else(|| anyhow::anyhow!(TransactionError::NotFound))
     }
 
     async fn find_disputed_transaction(&self, tx_id: u32) -> anyhow::Result<Transaction> {
@@ -170,7 +169,7 @@ impl Storage for LocalMemoryStorage {
         disputed_transactions
             .get(&tx_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Disputed transaction not found"))
+            .ok_or_else(|| anyhow::anyhow!(TransactionError::NotFound))
     }
 
     async fn has_transaction_been_processed(&self, tx_id: u32) -> anyhow::Result<bool> {

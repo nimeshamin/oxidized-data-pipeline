@@ -85,11 +85,32 @@ async fn worker_loop(
             tx_id = tx.tx_id,
             "processing transaction"
         );
-        try_process_transaction(tx, Arc::clone(&storage))
+        process_transaction(tx, Arc::clone(&storage))
             .await
             .unwrap_or_else(|err| {
                 tracing::debug!(worker = worker_id, error = %err, "ignoring failed transaction");
             });
+    }
+}
+
+/// Wrapper to catch all errors and conditionally ignore them based on type.
+async fn process_transaction(tx: Transaction, storage: Arc<dyn Storage>) -> anyhow::Result<()> {
+    match try_process_transaction(tx, storage).await {
+        Ok(()) => Ok(()),
+        Err(err) => match err.downcast_ref::<crate::ports::TransactionError>() {
+            Some(crate::ports::TransactionError::NotFound)
+            | Some(crate::ports::TransactionError::InsufficientFunds)
+            | Some(crate::ports::TransactionError::InvalidTransactionAmount) => {
+                tracing::debug!(error = %err, "ignoring non-fatal transaction error");
+                Ok(())
+            }
+            Some(crate::ports::TransactionError::InvalidTransactionStorageAttempt)
+            | Some(crate::ports::TransactionError::StoreCorruptionDetected) => {
+                tracing::error!(error = %err, "transaction processing error");
+                Err(err)
+            }
+            None => Err(err),
+        },
     }
 }
 
@@ -130,8 +151,10 @@ async fn try_process_transaction(tx: Transaction, storage: Arc<dyn Storage>) -> 
         // total funds of the client account
         crate::ports::TxType::Deposit => {
             if tx.amount < 0.0 {
-                // Negative deposit amount, ignore the transaction
-                return Ok(());
+                // Negative deposit amount, return an error
+                return Err(anyhow::anyhow!(
+                    crate::ports::TransactionError::InvalidTransactionAmount
+                ));
             }
             let new_available = account.available + tx.amount;
             let new_total = account.total + tx.amount;
@@ -149,12 +172,16 @@ async fn try_process_transaction(tx: Transaction, storage: Arc<dyn Storage>) -> 
         // total funds of the client account
         crate::ports::TxType::Withdrawal => {
             if tx.amount < 0.0 {
-                // Negative withdrawal amount, ignore the transaction
-                return Ok(());
+                // Negative withdrawal amount, return an error
+                return Err(anyhow::anyhow!(
+                    crate::ports::TransactionError::InvalidTransactionAmount
+                ));
             }
             if account.available < tx.amount {
-                // Insufficient funds, ignore the transaction
-                return Ok(());
+                // Insufficient funds
+                return Err(anyhow::anyhow!(
+                    crate::ports::TransactionError::InsufficientFunds
+                ));
             }
             let new_available = account.available - tx.amount;
             let new_total = account.total - tx.amount;
@@ -308,7 +335,7 @@ impl TransactionProcessor {
 mod tests {
     use std::sync::Arc;
 
-    use super::try_process_transaction;
+    use super::process_transaction;
     use crate::ports::{Storage, Transaction, TxType};
     use crate::storage::local_memory::LocalMemoryStorage;
 
@@ -321,9 +348,9 @@ mod tests {
         }
     }
 
-    /// Convenience wrapper: run a transaction against storage, panicking on error.
+    /// Convenience wrapper: run a transaction against storage, panicking on unexpected errors.
     async fn run(storage: &Arc<LocalMemoryStorage>, transaction: Transaction) {
-        try_process_transaction(
+        process_transaction(
             transaction,
             Arc::clone(storage) as Arc<dyn crate::ports::Storage>,
         )
