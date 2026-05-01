@@ -1,17 +1,11 @@
 pub mod csv_source;
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
-/// Consistent-hash router: maps a `u16` key to a channel index in
+/// Modulo-partition router: maps a `u16` key to a channel index in
 /// `[0, parallelism)`. The result depends on both `key` and `parallelism`,
 /// matching the project requirement that the routing function be parameterised
 /// by the configured worker count.
 pub fn route(key: u16, parallelism: usize) -> usize {
-    let n = parallelism.max(1);
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    (hasher.finish() as usize) % n
+    key as usize % parallelism
 }
 
 #[cfg(test)]

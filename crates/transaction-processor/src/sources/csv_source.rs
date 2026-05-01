@@ -37,7 +37,7 @@ impl CsvTransaction {
 }
 
 /// Single-instance CSV source. Reads rows asynchronously via `csv-async` and
-/// fans them out across the supplied bounded channels using the consistent-hash
+/// fans them out across the supplied bounded channels using the modulo-partition
 /// router.
 pub struct CsvSource {
     path: PathBuf,

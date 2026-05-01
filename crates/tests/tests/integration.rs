@@ -17,7 +17,7 @@ use transaction_processor::TransactionProcessor;
 #[global_allocator]
 static GLOBAL: peak_alloc::PeakAlloc = PEAK_ALLOC;
 
-fn init_tracing(debug: bool) {
+fn ensure_tracing(debug: bool) {
     let filter = if debug {
         EnvFilter::new("debug")
     } else {
@@ -58,7 +58,7 @@ async fn cli_main_with_tracing_flag() -> anyhow::Result<()> {
 #[tokio::test]
 async fn transaction_processor_direct_use_simple_single_worker() -> anyhow::Result<()> {
     let _m = MetricsGuard::new("transaction_processor_direct_use_simple_single_worker");
-    init_tracing(true);
+    ensure_tracing(true);
 
     let processor = TransactionProcessor::builder()
         .parallelism(1)
@@ -75,7 +75,7 @@ async fn transaction_processor_direct_use_simple_single_worker() -> anyhow::Resu
     assert!(idx_a < 1);
 
     let result = processor
-        .ingest_csv(Path::new("./tests/data/test_input_simple.csv"))
+        .ingest_csv(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/test_input_simple.csv"))
         .await;
     if result.is_err() {
         eprintln!("ingest_csv error: {:?}", result.as_ref().err());
@@ -116,7 +116,7 @@ async fn transaction_processor_direct_use_perf() -> anyhow::Result<()> {
         .await?;
 
     let result = processor
-        .ingest_csv(Path::new("./tests/data/test_input_stress.csv"))
+        .ingest_csv(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/test_input_stress.csv"))
         .await;
     if result.is_err() {
         eprintln!("ingest_csv error: {:?}", result.as_ref().err());

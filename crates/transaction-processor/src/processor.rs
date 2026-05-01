@@ -89,7 +89,9 @@ async fn worker_loop(
         process_transaction(tx, Arc::clone(&storage))
             .await
             .unwrap_or_else(|err| {
-                tracing::debug!(worker = worker_id, error = %err, "ignoring failed transaction");
+                tracing::error!(worker = worker_id, error = %err, "unexpected failure processing transaction");
+                // throw the error to crash the worker - we want to fail fast on unexpected errors
+                panic!("worker {worker_id} encountered an error: {err}");
             });
     }
 }
@@ -297,7 +299,7 @@ impl TransactionProcessor {
         Arc::clone(&self.storage)
     }
 
-    /// Map a `u16` key onto a worker channel index using the consistent-hash
+    /// Map a `u16` key onto a worker channel index using the
     /// routing function. The result is in `[0, parallelism)`.
     pub fn route(&self, key: u16) -> usize {
         crate::sources::route(key, self.parallelism)

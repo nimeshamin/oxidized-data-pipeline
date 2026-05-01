@@ -3,8 +3,8 @@
 //!   sources (port + adapters)  ->  processor core  ->  storage (port + adapters)
 //!
 //! The processor owns N bounded mpsc channels (N = parallelism). A single source
-//! instance fans out into all channels using a consistent-hash routing function
-//! keyed by `u32`. Each channel drains into a worker that delegates to the
+//! instance fans out into all channels using a modulo-partition routing function
+//! keyed by `u16`. Each channel drains into a worker that delegates to the
 //! configured `Storage` adapter.
 
 pub mod ports;
