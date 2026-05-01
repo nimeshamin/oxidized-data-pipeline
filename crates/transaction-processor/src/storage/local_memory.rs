@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use tokio::sync::Mutex;
 
 use crate::{
     ports::{Account, Storage, TransactionError, TxType},
@@ -33,7 +33,7 @@ pub struct LocalMemoryStorage {
     accounts: Mutex<HashMap<u16, Account>>,
     transactions: Mutex<HashMap<u32, Transaction>>,
     disputed_transactions: Mutex<HashMap<u32, Transaction>>,
-    reverted_transactions: Mutex<HashMap<u32, Transaction>>,
+    processed_tx_ids: Mutex<HashSet<u32>>,
 }
 
 impl LocalMemoryStorage {
@@ -41,55 +41,56 @@ impl LocalMemoryStorage {
         Self::default()
     }
 
-    pub async fn len(&self) -> usize {
-        self.accounts.lock().await.len()
+    pub fn len(&self) -> usize {
+        self.accounts.lock().unwrap().len()
     }
 
-    pub async fn snapshot(&self) -> Vec<Account> {
-        self.accounts.lock().await.values().cloned().collect()
+    pub fn snapshot(&self) -> Vec<Account> {
+        self.accounts.lock().unwrap().values().cloned().collect()
     }
 
-    pub async fn update(&self, account: Account) {
-        let mut accounts = self.accounts.lock().await;
-        accounts.insert(account.client_id, account);
+    pub fn update(&self, account: Account) {
+        self.accounts
+            .lock()
+            .unwrap()
+            .insert(account.client_id, account);
     }
 
-    pub async fn transfer_from_transactions_to_disputed(&self, tx_id: u32) -> anyhow::Result<()> {
+    pub fn transfer_from_transactions_to_disputed(&self, tx_id: u32) -> anyhow::Result<()> {
         let tx = self
             .transactions
             .lock()
-            .await
+            .unwrap()
             .remove(&tx_id)
             .ok_or_else(|| anyhow::anyhow!(TransactionError::StoreCorruptionDetected))?;
-        self.disputed_transactions.lock().await.insert(tx_id, tx);
+        self.disputed_transactions.lock().unwrap().insert(tx_id, tx);
         Ok(())
     }
 
-    pub async fn transfer_from_disputed_to_transactions(&self, tx_id: u32) -> anyhow::Result<()> {
+    pub fn transfer_from_disputed_to_transactions(&self, tx_id: u32) -> anyhow::Result<()> {
         let tx = self
             .disputed_transactions
             .lock()
-            .await
+            .unwrap()
             .remove(&tx_id)
             .ok_or_else(|| anyhow::anyhow!(TransactionError::StoreCorruptionDetected))?;
-        self.transactions.lock().await.insert(tx_id, tx);
+        self.transactions.lock().unwrap().insert(tx_id, tx);
         Ok(())
     }
 
-    pub async fn transfer_from_disputed_to_reverted(&self, tx_id: u32) -> anyhow::Result<()> {
-        let tx = self
-            .disputed_transactions
+    pub fn discard_disputed(&self, tx_id: u32) -> anyhow::Result<()> {
+        self.disputed_transactions
             .lock()
-            .await
+            .unwrap()
             .remove(&tx_id)
             .ok_or_else(|| anyhow::anyhow!(TransactionError::StoreCorruptionDetected))?;
-        self.reverted_transactions.lock().await.insert(tx_id, tx);
         Ok(())
     }
 
-    pub async fn get_or_create(&self, client_id: u16) -> Account {
-        let mut accounts = self.accounts.lock().await;
-        accounts
+    pub fn get_or_create(&self, client_id: u16) -> Account {
+        self.accounts
+            .lock()
+            .unwrap()
             .entry(client_id)
             .or_insert_with(|| Account {
                 client_id,
@@ -101,10 +102,11 @@ impl LocalMemoryStorage {
             .clone()
     }
 
-    pub async fn add_transaction(&self, tx: MonetaryTransaction) {
+    pub fn add_transaction(&self, tx: MonetaryTransaction) {
         let tx = tx.0;
-        let mut transactions = self.transactions.lock().await;
-        transactions.insert(tx.tx_id, tx);
+        let tx_id = tx.tx_id;
+        self.transactions.lock().unwrap().insert(tx_id, tx);
+        self.processed_tx_ids.lock().unwrap().insert(tx_id);
     }
 }
 
@@ -115,9 +117,8 @@ impl Storage for LocalMemoryStorage {
         tx: Transaction,
         account: Account,
     ) -> anyhow::Result<()> {
-        self.update(account).await;
-        self.add_transaction(MonetaryTransaction::try_from(tx)?)
-            .await;
+        self.update(account);
+        self.add_transaction(MonetaryTransaction::try_from(tx)?);
         Ok(())
     }
 
@@ -126,9 +127,8 @@ impl Storage for LocalMemoryStorage {
         tx: Transaction,
         account: Account,
     ) -> anyhow::Result<()> {
-        self.update(account).await;
-        self.transfer_from_transactions_to_disputed(tx.tx_id)
-            .await?;
+        self.update(account);
+        self.transfer_from_transactions_to_disputed(tx.tx_id)?;
         Ok(())
     }
 
@@ -137,9 +137,8 @@ impl Storage for LocalMemoryStorage {
         tx: Transaction,
         account: Account,
     ) -> anyhow::Result<()> {
-        self.update(account).await;
-        self.transfer_from_disputed_to_transactions(tx.tx_id)
-            .await?;
+        self.update(account);
+        self.transfer_from_disputed_to_transactions(tx.tx_id)?;
         Ok(())
     }
 
@@ -148,49 +147,44 @@ impl Storage for LocalMemoryStorage {
         tx: Transaction,
         account: Account,
     ) -> anyhow::Result<()> {
-        self.update(account).await;
-        self.transfer_from_disputed_to_reverted(tx.tx_id).await?;
+        self.update(account);
+        self.discard_disputed(tx.tx_id)?;
         Ok(())
     }
 
     async fn get_account(&self, client_id: u16) -> anyhow::Result<Account> {
-        Ok(self.get_or_create(client_id).await)
+        Ok(self.get_or_create(client_id))
     }
 
     async fn find_transaction(&self, tx_id: u32) -> anyhow::Result<Transaction> {
-        let transactions = self.transactions.lock().await;
-        transactions
+        self.transactions
+            .lock()
+            .unwrap()
             .get(&tx_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!(TransactionError::NotFound))
     }
 
     async fn find_disputed_transaction(&self, tx_id: u32) -> anyhow::Result<Transaction> {
-        let disputed_transactions = self.disputed_transactions.lock().await;
-        disputed_transactions
+        self.disputed_transactions
+            .lock()
+            .unwrap()
             .get(&tx_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!(TransactionError::NotFound))
     }
 
     async fn has_transaction_been_processed(&self, tx_id: u32) -> anyhow::Result<bool> {
-        if self.transactions.lock().await.contains_key(&tx_id) {
-            return Ok(true);
-        }
-        if self.disputed_transactions.lock().await.contains_key(&tx_id) {
-            return Ok(true);
-        }
-        Ok(self.reverted_transactions.lock().await.contains_key(&tx_id))
+        Ok(self.processed_tx_ids.lock().unwrap().contains(&tx_id))
     }
 
     async fn all_accounts(&self, page: usize, page_size: usize) -> anyhow::Result<Vec<Account>> {
-        let accounts = self.accounts.lock().await;
-        let result = accounts
+        let accounts = self.accounts.lock().unwrap();
+        Ok(accounts
             .values()
             .skip(page * page_size)
             .take(page_size)
             .cloned()
-            .collect();
-        Ok(result)
+            .collect())
     }
 }

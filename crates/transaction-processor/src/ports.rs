@@ -23,7 +23,7 @@ pub enum TransactionError {
     InvalidTransactionAmount,
     #[error("only Deposit and Withdrawal transactions can be stored as monetary transactions")]
     InvalidTransactionStorageAttempt,
-    #[error("expected transaction for ACID update not found or invalid. Logic, data corruption or race condition.")]
+    #[error("expected transaction for atomic update not found or invalid. Logic, data corruption or race condition.")]
     StoreCorruptionDetected,
 }
 
