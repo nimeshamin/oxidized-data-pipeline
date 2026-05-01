@@ -111,18 +111,37 @@ async fn transaction_processor_direct_use() -> anyhow::Result<()> {
     init_tracing(true);
 
     let processor = TransactionProcessor::builder()
-        .parallelism(4)
-        .channel_capacity(128)
+        .parallelism(8)
+        .channel_capacity(64)
         .build()
         .await?;
 
-    assert_eq!(processor.parallelism(), 4);
-    assert_eq!(processor.channel_capacity(), 128);
+    let result = processor
+        .ingest_csv(Path::new("./tests/data/test_input_large.csv"))
+        .await;
+    if result.is_err() {
+        eprintln!("ingest_csv error: {:?}", result.as_ref().err());
+    }
+    assert!(result.is_ok(), "ingest_csv should succeed with valid input");
 
-    let idx_a = processor.route(42);
-    let idx_b = processor.route(42);
-    assert_eq!(idx_a, idx_b, "router must be deterministic");
-    assert!(idx_a < 4);
+    let accounts = processor.snapshot_accounts(0, 1).await?;
+    assert!(
+        !accounts.is_empty(),
+        "snapshot_accounts should return some accounts"
+    );
+    // Loop until there are no more items. Print each account as a line of output
+    let mut page = 0;
+    let page_size = 1;
+    loop {
+        let accounts = processor.snapshot_accounts(page, page_size).await?;
+        if accounts.is_empty() {
+            break;
+        }
+        for account in accounts {
+            println!("{:?}", account);
+        }
+        page += 1;
+    }
 
     processor.shutdown().await?;
     Ok(())

@@ -55,36 +55,36 @@ impl LocalMemoryStorage {
     }
 
     pub async fn transfer_from_transactions_to_disputed(&self, tx_id: u32) -> anyhow::Result<()> {
-        let mut transactions = self.transactions.lock().await;
-        if let Some(tx) = transactions.remove(&tx_id) {
-            let mut disputed_transactions = self.disputed_transactions.lock().await;
-            disputed_transactions.insert(tx_id, tx);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(TransactionError::StoreCorruptionDetected))
-        }
+        let tx = self
+            .transactions
+            .lock()
+            .await
+            .remove(&tx_id)
+            .ok_or_else(|| anyhow::anyhow!(TransactionError::StoreCorruptionDetected))?;
+        self.disputed_transactions.lock().await.insert(tx_id, tx);
+        Ok(())
     }
 
     pub async fn transfer_from_disputed_to_transactions(&self, tx_id: u32) -> anyhow::Result<()> {
-        let mut disputed_transactions = self.disputed_transactions.lock().await;
-        if let Some(tx) = disputed_transactions.remove(&tx_id) {
-            let mut transactions = self.transactions.lock().await;
-            transactions.insert(tx_id, tx);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(TransactionError::StoreCorruptionDetected))
-        }
+        let tx = self
+            .disputed_transactions
+            .lock()
+            .await
+            .remove(&tx_id)
+            .ok_or_else(|| anyhow::anyhow!(TransactionError::StoreCorruptionDetected))?;
+        self.transactions.lock().await.insert(tx_id, tx);
+        Ok(())
     }
 
     pub async fn transfer_from_disputed_to_reverted(&self, tx_id: u32) -> anyhow::Result<()> {
-        let mut disputed_transactions = self.disputed_transactions.lock().await;
-        if let Some(tx) = disputed_transactions.remove(&tx_id) {
-            let mut reverted_transactions = self.reverted_transactions.lock().await;
-            reverted_transactions.insert(tx_id, tx);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(TransactionError::StoreCorruptionDetected))
-        }
+        let tx = self
+            .disputed_transactions
+            .lock()
+            .await
+            .remove(&tx_id)
+            .ok_or_else(|| anyhow::anyhow!(TransactionError::StoreCorruptionDetected))?;
+        self.reverted_transactions.lock().await.insert(tx_id, tx);
+        Ok(())
     }
 
     pub async fn get_or_create(&self, client_id: u16) -> Account {
@@ -174,12 +174,13 @@ impl Storage for LocalMemoryStorage {
     }
 
     async fn has_transaction_been_processed(&self, tx_id: u32) -> anyhow::Result<bool> {
-        let transactions = self.transactions.lock().await;
-        let disputed_transactions = self.disputed_transactions.lock().await;
-        let reverted_transactions = self.reverted_transactions.lock().await;
-        Ok(transactions.contains_key(&tx_id)
-            || disputed_transactions.contains_key(&tx_id)
-            || reverted_transactions.contains_key(&tx_id))
+        if self.transactions.lock().await.contains_key(&tx_id) {
+            return Ok(true);
+        }
+        if self.disputed_transactions.lock().await.contains_key(&tx_id) {
+            return Ok(true);
+        }
+        Ok(self.reverted_transactions.lock().await.contains_key(&tx_id))
     }
 
     async fn all_accounts(&self, page: usize, page_size: usize) -> anyhow::Result<Vec<Account>> {
