@@ -12,6 +12,6 @@ pub mod processor;
 pub mod sources;
 pub mod storage;
 
-pub use ports::{Source, Storage, Transaction};
+pub use ports::{ProcessOutcome, ProcessorSoftFailures, Source, Storage, Transaction};
 pub use processor::{TransactionProcessor, TransactionProcessorBuilder};
 pub use sources::route;

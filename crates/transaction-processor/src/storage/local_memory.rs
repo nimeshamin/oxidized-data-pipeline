@@ -156,22 +156,17 @@ impl Storage for LocalMemoryStorage {
         Ok(self.get_or_create(client_id))
     }
 
-    async fn find_transaction(&self, tx_id: u32) -> anyhow::Result<Transaction> {
-        self.transactions
-            .lock()
-            .unwrap()
-            .get(&tx_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!(TransactionError::NotFound))
+    async fn find_transaction(&self, tx_id: u32) -> anyhow::Result<Option<Transaction>> {
+        Ok(self.transactions.lock().unwrap().get(&tx_id).cloned())
     }
 
-    async fn find_disputed_transaction(&self, tx_id: u32) -> anyhow::Result<Transaction> {
-        self.disputed_transactions
+    async fn find_disputed_transaction(&self, tx_id: u32) -> anyhow::Result<Option<Transaction>> {
+        Ok(self
+            .disputed_transactions
             .lock()
             .unwrap()
             .get(&tx_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!(TransactionError::NotFound))
+            .cloned())
     }
 
     async fn has_transaction_been_processed(&self, tx_id: u32) -> anyhow::Result<bool> {

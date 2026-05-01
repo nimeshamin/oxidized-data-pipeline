@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::ports::{Account, Source, Storage, Transaction};
+use crate::ports::{Account, ProcessOutcome, Source, Storage, Transaction};
 use crate::sources::csv_source::CsvSource;
 use crate::storage::local_memory::LocalMemoryStorage;
 
@@ -75,203 +75,169 @@ impl TransactionProcessorBuilder {
     }
 }
 
+/// Main worker loop for each worker (count defined by `parallelism`). This waits on rx for incoming
+/// transactions being pushed by the source. Each transaction is processed synchronously to completion
+/// before the next one is pulled from the channel. This loop will only exit on channel closure, which
+/// is triggered by the processor's `shutdown` method, or a fatal error (storage I/O failure or
+/// violated invariant) that causes a panic.
 async fn worker_loop(
     worker_id: usize,
     mut rx: mpsc::Receiver<Transaction>,
     storage: Arc<dyn Storage>,
 ) {
     while let Some(tx) = rx.recv().await {
-        tracing::debug!(
-            worker = worker_id,
-            tx_id = tx.tx_id,
-            "processing transaction"
-        );
-        process_transaction(tx, Arc::clone(&storage))
-            .await
-            .unwrap_or_else(|err| {
-                tracing::error!(worker = worker_id, error = %err, "unexpected failure processing transaction");
-                // throw the error to crash the worker - we want to fail fast on unexpected errors
-                panic!("worker {worker_id} encountered an error: {err}");
-            });
-    }
-}
-
-/// Wrapper to catch all errors and conditionally ignore them based on type.
-async fn process_transaction(tx: Transaction, storage: Arc<dyn Storage>) -> anyhow::Result<()> {
-    match try_process_transaction(tx, storage).await {
-        Ok(()) => Ok(()),
-        Err(err) => match err.downcast_ref::<crate::ports::TransactionError>() {
-            Some(crate::ports::TransactionError::NotFound)
-            | Some(crate::ports::TransactionError::InsufficientFunds)
-            | Some(crate::ports::TransactionError::InvalidTransactionAmount) => {
-                tracing::debug!(error = %err, "ignoring non-fatal transaction error");
-                Ok(())
+        let tx_id = tx.tx_id;
+        match process_transaction(tx, Arc::clone(&storage)).await {
+            Ok(ProcessOutcome::Applied) => {
+                tracing::trace!(worker = worker_id, tx_id, "applied transaction");
             }
-            Some(crate::ports::TransactionError::InvalidTransactionStorageAttempt)
-            | Some(crate::ports::TransactionError::StoreCorruptionDetected) => {
-                tracing::error!(error = %err, "transaction processing error");
-                Err(err)
+            Ok(ProcessOutcome::SoftFailed(reason)) => {
+                tracing::debug!(
+                    worker = worker_id,
+                    tx_id,
+                    reason = reason.as_str(),
+                    "skipping transaction"
+                );
             }
-            None => Err(err),
-        },
-    }
-}
-
-async fn try_process_transaction(tx: Transaction, storage: Arc<dyn Storage>) -> anyhow::Result<()> {
-    // Skip monetary transactions that have already been processed. We are assuming that the lifecycle
-    // types won't have duplicates where a a duplicate dispute comes in after a resolve. We need to
-    // update the incoming Transaction model to be able to dedupe lifecycle events coming from the
-    // source to know which lifecycle events are actually dupes.
-    if tx.tx_type == crate::ports::TxType::Deposit || tx.tx_type == crate::ports::TxType::Withdrawal
-    {
-        if storage.has_transaction_been_processed(tx.tx_id).await? {
-            tracing::info!(
-                tx_id = tx.tx_id,
-                "transaction has already been processed, skipping"
-            );
-            return Ok(());
+            Err(err) => {
+                tracing::error!(
+                    worker = worker_id,
+                    tx_id,
+                    error = %err,
+                    "unexpected failure processing transaction"
+                );
+                // Fail fast: anything reaching this branch is a storage I/O
+                // failure or a violated internal invariant — not a recoverable
+                // business condition. Business no-ops are `ProcessOutcome::SoftFailed`.
+                panic!("worker {worker_id} encountered a fatal error: {err}");
+            }
         }
     }
+}
 
-    // First, get existing client account state from storage
+/// Apply a single transaction to storage.
+/// `Ok(Applied)` - state was mutated.
+/// `Ok(SoftFailed(reason))` - valid business no-op.
+/// `Err(_)` - genuine fault, such as storage I/O failure or violated invariant.
+async fn process_transaction(
+    tx: Transaction,
+    storage: Arc<dyn Storage>,
+) -> anyhow::Result<ProcessOutcome> {
+    use crate::ports::{ProcessOutcome::*, ProcessorSoftFailures::*, TxType::*};
+
+    // Dedup monetary tx_ids. Lifecycle events are validated below by their
+    // explicit lookup against the active or disputed maps, not via this gate.
+    if matches!(tx.tx_type, Deposit | Withdrawal)
+        && storage.has_transaction_been_processed(tx.tx_id).await?
+    {
+        return Ok(SoftFailed(AlreadyProcessed));
+    }
+
     let account = storage.get_account(tx.client_id).await?;
 
-    // If the account is locked, ignore withdrawals. Deposits and disputes/resolves/chargebacks on
-    // locked accounts should still be processed to allow for dispute resolution and potential
-    // unlocking in cases where the account has a negative balance due to a chargeback.
-    if account.locked && tx.tx_type == crate::ports::TxType::Withdrawal {
-        tracing::warn!(
-            client_id = tx.client_id,
-            tx_id = tx.tx_id,
-            "ignoring withdrawal on locked account"
-        );
-        return Ok(());
+    // Withdrawals on a locked account are silently ignored. Deposits and
+    // dispute-lifecycle events on locked accounts must still be processed
+    // (e.g. so an in-flight chargeback can complete on a previously locked
+    // account).
+    if account.locked && tx.tx_type == Withdrawal {
+        return Ok(SoftFailed(AccountLocked));
     }
 
-    // Apply the transaction to the account state
     match tx.tx_type {
-        // A deposit is a credit to the client's asset account, meaning it should increase the available and
-        // total funds of the client account
-        crate::ports::TxType::Deposit => {
+        // Credit: increases available and total.
+        Deposit => {
             if tx.amount < Decimal::ZERO {
-                // Negative deposit amount, return an error
-                return Err(anyhow::anyhow!(
-                    crate::ports::TransactionError::InvalidTransactionAmount
-                ));
+                return Ok(SoftFailed(NegativeAmount));
             }
-            let new_available = account.available + tx.amount;
-            let new_total = account.total + tx.amount;
-            let updated_account = Account {
-                available: new_available,
-                total: new_total,
+            let updated = Account {
+                available: account.available + tx.amount,
+                total: account.total + tx.amount,
                 ..account
             };
             storage
-                .update_account_for_withdrawal_or_deposit(tx, updated_account)
+                .update_account_for_withdrawal_or_deposit(tx, updated)
                 .await?;
+            Ok(Applied)
         }
 
-        // A withdraw is a debit to the client's asset account, meaning it should decrease the available and
-        // total funds of the client account
-        crate::ports::TxType::Withdrawal => {
+        // Debit: decreases available and total. Rejected if it would overdraw.
+        Withdrawal => {
             if tx.amount < Decimal::ZERO {
-                // Negative withdrawal amount, return an error
-                return Err(anyhow::anyhow!(
-                    crate::ports::TransactionError::InvalidTransactionAmount
-                ));
+                return Ok(SoftFailed(NegativeAmount));
             }
             if account.available < tx.amount {
-                // Insufficient funds
-                return Err(anyhow::anyhow!(
-                    crate::ports::TransactionError::InsufficientFunds
-                ));
+                return Ok(SoftFailed(InsufficientFunds));
             }
-            let new_available = account.available - tx.amount;
-            let new_total = account.total - tx.amount;
-            let updated_account = Account {
-                available: new_available,
-                total: new_total,
+            let updated = Account {
+                available: account.available - tx.amount,
+                total: account.total - tx.amount,
                 ..account
             };
             storage
-                .update_account_for_withdrawal_or_deposit(tx, updated_account)
+                .update_account_for_withdrawal_or_deposit(tx, updated)
                 .await?;
+            Ok(Applied)
         }
 
-        // A dispute represents a client's claim that a transaction was erroneous and should be reversed.
-        // This is the beginning of a dispute lifecycle, which may later be resolved or chargebacked. This
-        // is expected to move the disputed amount from available to held, keeping total the same. Allow
-        // even if the account is locked, since disputes can be opened on already-locked accounts.
-        crate::ports::TxType::Dispute => {
-            let disputed_tx = storage.find_transaction(tx.tx_id).await?;
+        // Dispute opens a hold against an existing deposit, moving funds from
+        // available → held. Allowed even on locked accounts so chargeback
+        // lifecycles can be opened post-lock.
+        Dispute => {
+            let Some(disputed_tx) = storage.find_transaction(tx.tx_id).await? else {
+                return Ok(SoftFailed(DisputedTransactionNotFound));
+            };
             if disputed_tx.client_id != tx.client_id {
-                // Transaction client ID mismatch, ignore the dispute
-                return Ok(());
+                return Ok(SoftFailed(ClientIdMismatch));
             }
-            if disputed_tx.tx_type != crate::ports::TxType::Deposit {
-                // Only deposits can be disputed, ignore otherwise
-                return Ok(());
+            if disputed_tx.tx_type != Deposit {
+                return Ok(SoftFailed(DisputeOnNonDeposit));
             }
-            let new_available = account.available - disputed_tx.amount;
-            let new_held = account.held + disputed_tx.amount;
-            let updated_account = Account {
-                available: new_available,
-                held: new_held,
+            let updated = Account {
+                available: account.available - disputed_tx.amount,
+                held: account.held + disputed_tx.amount,
                 ..account
             };
-            // These pairs of updates should be atomic. If there's a failure, we should revert
-            storage
-                .update_account_for_dispute(tx, updated_account)
-                .await?;
+            storage.update_account_for_dispute(tx, updated).await?;
+            Ok(Applied)
         }
 
-        // A resolve represents a resolution to a dispute, releasing the associated held funds. Funds that
-        // were previously disputed are no longer disputed. This is expected to return the funds to the
-        // client's available balance, decrease the held and keep total the same. This should be allowed
-        // even if the account is locked.
-        crate::ports::TxType::Resolve => {
-            let disputed_tx = storage.find_disputed_transaction(tx.tx_id).await?;
+        // Resolve releases held funds back to available; total unchanged.
+        Resolve => {
+            let Some(disputed_tx) = storage.find_disputed_transaction(tx.tx_id).await? else {
+                return Ok(SoftFailed(DisputedTransactionNotFound));
+            };
             if disputed_tx.client_id != tx.client_id {
-                // Transaction client ID mismatch, ignore the resolve
-                return Ok(());
+                return Ok(SoftFailed(ClientIdMismatch));
             }
-            let new_available = account.available + disputed_tx.amount;
-            let new_held = account.held - disputed_tx.amount;
-            let updated_account = Account {
-                available: new_available,
-                held: new_held,
+            let updated = Account {
+                available: account.available + disputed_tx.amount,
+                held: account.held - disputed_tx.amount,
                 ..account
             };
-            storage
-                .update_account_for_resolve(tx, updated_account)
-                .await?;
+            storage.update_account_for_resolve(tx, updated).await?;
+            Ok(Applied)
         }
 
-        // A chargeback is expected to be the final outcome of a dispute. This should remove the disputed
-        // funds from held and total, and also lock the client's account to prevent further transactions.
-        // If there's another chargeback on an already-locked account, we should still process it to
-        // ensure the disputed funds are removed, but the account should remain locked.
-        crate::ports::TxType::Chargeback => {
-            let disputed_tx = storage.find_disputed_transaction(tx.tx_id).await?;
+        // Chargeback removes held funds from total and locks the account.
+        // A second chargeback for a tx_id no longer in the disputed map is
+        // surfaced as `DisputedTransactionNotFound`, not an error.
+        Chargeback => {
+            let Some(disputed_tx) = storage.find_disputed_transaction(tx.tx_id).await? else {
+                return Ok(SoftFailed(DisputedTransactionNotFound));
+            };
             if disputed_tx.client_id != tx.client_id {
-                // Transaction client ID mismatch, ignore the chargeback
-                return Ok(());
+                return Ok(SoftFailed(ClientIdMismatch));
             }
-            let new_held = account.held - disputed_tx.amount;
-            let new_total = account.total - disputed_tx.amount;
-            let updated_account = Account {
-                held: new_held,
-                total: new_total,
+            let updated = Account {
+                held: account.held - disputed_tx.amount,
+                total: account.total - disputed_tx.amount,
                 locked: true,
                 ..account
             };
-            storage
-                .update_account_for_chargeback(tx, updated_account)
-                .await?;
+            storage.update_account_for_chargeback(tx, updated).await?;
+            Ok(Applied)
         }
     }
-
-    Ok(())
 }
 
 pub struct TransactionProcessor {
@@ -341,7 +307,9 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::process_transaction;
-    use crate::ports::{Storage, Transaction, TxType};
+    use crate::ports::{
+        ProcessOutcome, ProcessorSoftFailures, SkipReason, Storage, Transaction, TxType,
+    };
     use crate::storage::local_memory::LocalMemoryStorage;
 
     fn make_tx(tx_type: TxType, client_id: u16, tx_id: u32, amount: f64) -> Transaction {
@@ -357,14 +325,13 @@ mod tests {
         Decimal::try_from(v).unwrap()
     }
 
-    /// Convenience wrapper: run a transaction against storage, panicking on unexpected errors.
-    async fn run(storage: &Arc<LocalMemoryStorage>, transaction: Transaction) {
-        process_transaction(
-            transaction,
-            Arc::clone(storage) as Arc<dyn crate::ports::Storage>,
-        )
-        .await
-        .unwrap();
+    /// Run a transaction and return the outcome. Panics on fatal errors —
+    /// reaching that branch would mean a storage fault or violated invariant,
+    /// which a test should never silently accept.
+    async fn run(storage: &Arc<LocalMemoryStorage>, transaction: Transaction) -> ProcessOutcome {
+        process_transaction(transaction, Arc::clone(storage) as Arc<dyn Storage>)
+            .await
+            .expect("process_transaction returned a fatal error")
     }
 
     // -------------------------------------------------------------------------
@@ -386,7 +353,11 @@ mod tests {
     #[tokio::test]
     async fn deposit_negative_amount_is_ignored() {
         let storage = Arc::new(LocalMemoryStorage::new());
-        run(&storage, make_tx(TxType::Deposit, 1, 1, -50.0)).await;
+        let outcome = run(&storage, make_tx(TxType::Deposit, 1, 1, -50.0)).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::NegativeAmount)
+        );
 
         let account = storage.get_account(1).await.unwrap();
         assert_eq!(account.available, Decimal::ZERO);
@@ -431,7 +402,11 @@ mod tests {
     async fn withdrawal_negative_amount_is_ignored() {
         let storage = Arc::new(LocalMemoryStorage::new());
         run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-        run(&storage, make_tx(TxType::Withdrawal, 1, 2, -10.0)).await;
+        let outcome = run(&storage, make_tx(TxType::Withdrawal, 1, 2, -10.0)).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::NegativeAmount)
+        );
 
         let account = storage.get_account(1).await.unwrap();
         assert_eq!(account.available, d(100.0));
@@ -442,7 +417,11 @@ mod tests {
     async fn withdrawal_with_insufficient_funds_is_ignored() {
         let storage = Arc::new(LocalMemoryStorage::new());
         run(&storage, make_tx(TxType::Deposit, 1, 1, 50.0)).await;
-        run(&storage, make_tx(TxType::Withdrawal, 1, 2, 100.0)).await;
+        let outcome = run(&storage, make_tx(TxType::Withdrawal, 1, 2, 100.0)).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::InsufficientFunds)
+        );
 
         let account = storage.get_account(1).await.unwrap();
         assert_eq!(account.available, d(50.0));
@@ -461,7 +440,11 @@ mod tests {
         let before = storage.get_account(1).await.unwrap();
         assert!(before.locked);
 
-        run(&storage, make_tx(TxType::Withdrawal, 1, 3, 50.0)).await;
+        let outcome = run(&storage, make_tx(TxType::Withdrawal, 1, 3, 50.0)).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::AccountLocked)
+        );
 
         let after = storage.get_account(1).await.unwrap();
         assert_eq!(after.available, before.available);
@@ -491,7 +474,11 @@ mod tests {
         run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
 
         // Client 2 tries to dispute a transaction belonging to client 1
-        run(&storage, make_tx(TxType::Dispute, 2, 1, 0.0)).await;
+        let outcome = run(&storage, make_tx(TxType::Dispute, 2, 1, 0.0)).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::ClientIdMismatch)
+        );
 
         let account = storage.get_account(1).await.unwrap();
         assert_eq!(account.available, d(100.0));
@@ -506,7 +493,11 @@ mod tests {
         run(&storage, make_tx(TxType::Withdrawal, 1, 2, 40.0)).await;
 
         // Attempting to dispute the withdrawal (tx_id=2) — only deposits may be disputed
-        run(&storage, make_tx(TxType::Dispute, 1, 2, 0.0)).await;
+        let outcome = run(&storage, make_tx(TxType::Dispute, 1, 2, 0.0)).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::DisputeOnNonDeposit)
+        );
 
         let account = storage.get_account(1).await.unwrap();
         assert_eq!(account.available, d(60.0));
@@ -562,7 +553,11 @@ mod tests {
         run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
 
         // Client 2 tries to resolve a dispute belonging to client 1
-        run(&storage, make_tx(TxType::Resolve, 2, 1, 0.0)).await;
+        let outcome = run(&storage, make_tx(TxType::Resolve, 2, 1, 0.0)).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::ClientIdMismatch)
+        );
 
         let account = storage.get_account(1).await.unwrap();
         // Funds should remain held
@@ -620,7 +615,11 @@ mod tests {
         run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
 
         // Client 2 tries to chargeback a dispute belonging to client 1
-        run(&storage, make_tx(TxType::Chargeback, 2, 1, 0.0)).await;
+        let outcome = run(&storage, make_tx(TxType::Chargeback, 2, 1, 0.0)).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::ClientIdMismatch)
+        );
 
         let account = storage.get_account(1).await.unwrap();
         assert_eq!(account.held, d(100.0));
@@ -658,7 +657,15 @@ mod tests {
     async fn duplicate_withdrawals_and_deposits_are_processed_idempotently() {
         let storage = Arc::new(LocalMemoryStorage::new());
         run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
+
+        // The duplicate must surface as SoftFail(AlreadyProcessed) — this is
+        // the central guarantee of `has_transaction_been_processed`.
+        let dup = run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
+        assert_eq!(
+            dup,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::AlreadyProcessed)
+        );
+
         run(&storage, make_tx(TxType::Withdrawal, 1, 2, 30.0)).await;
         run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
         run(&storage, make_tx(TxType::Withdrawal, 1, 2, 30.0)).await;
@@ -680,8 +687,13 @@ mod tests {
         assert_eq!(after_first.held, d(100.0));
         assert_eq!(after_first.total, d(100.0));
 
-        // Second and third duplicate disputes — each errors at storage level and is swallowed
-        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
+        // Second dispute — tx_id=1 has already moved out of `transactions`,
+        // so the outcome is SoftFailed(DisputedTransactionNotFound), not an error.
+        let dup = run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
+        assert_eq!(
+            dup,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::DisputedTransactionNotFound)
+        );
         run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
 
         let after_duplicates = storage.get_account(1).await.unwrap();
@@ -703,7 +715,11 @@ mod tests {
         assert_eq!(after_first.total, d(100.0));
 
         // Duplicate resolves — tx_id=1 is no longer in disputed_transactions
-        run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
+        let dup = run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
+        assert_eq!(
+            dup,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::DisputedTransactionNotFound)
+        );
         run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
 
         let after_duplicates = storage.get_account(1).await.unwrap();
@@ -726,7 +742,11 @@ mod tests {
         assert!(after_first.locked);
 
         // Duplicate chargebacks — tx_id=1 is no longer in disputed_transactions
-        run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
+        let dup = run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
+        assert_eq!(
+            dup,
+            ProcessOutcome::SoftFailed(ProcessorSoftFailures::DisputedTransactionNotFound)
+        );
         run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
 
         let after_duplicates = storage.get_account(1).await.unwrap();
