@@ -1,15 +1,25 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::ports::{Account, ProcessOutcome, Source, Storage, Transaction};
+use crate::domain::{Account, ProcessorSoftFailures, Transaction};
+use crate::ports::{Source, Storage};
 use crate::sources::csv_source::CsvSource;
 use crate::storage::local_memory::LocalMemoryStorage;
 
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 512;
+
+/// Result of processing a single transaction.
+/// `Applied` => storage was mutated.
+/// `SoftFailed` => transaction was a valid business no-op (see
+/// [`ProcessorSoftFailures`] for the reason vocabulary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOutcome {
+    Applied,
+    SoftFailed(ProcessorSoftFailures),
+}
 
 pub struct TransactionProcessorBuilder {
     parallelism: Option<usize>,
@@ -123,7 +133,8 @@ async fn process_transaction(
     tx: Transaction,
     storage: Arc<dyn Storage>,
 ) -> anyhow::Result<ProcessOutcome> {
-    use crate::ports::{ProcessOutcome::*, ProcessorSoftFailures::*, TxType::*};
+    use crate::domain::{ProcessorSoftFailures::*, TxType::*};
+    use ProcessOutcome::*;
 
     // Dedup monetary tx_ids. Lifecycle events are validated below by their
     // explicit lookup against the active or disputed maps, not via this gate.
@@ -135,53 +146,30 @@ async fn process_transaction(
 
     let account = storage.get_account(tx.client_id).await?;
 
-    // Withdrawals on a locked account are silently ignored. Deposits and
-    // dispute-lifecycle events on locked accounts must still be processed
-    // (e.g. so an in-flight chargeback can complete on a previously locked
-    // account).
-    if account.locked && tx.tx_type == Withdrawal {
-        return Ok(SoftFailed(AccountLocked));
-    }
-
     match tx.tx_type {
-        // Credit: increases available and total.
-        Deposit => {
-            if tx.amount < Decimal::ZERO {
-                return Ok(SoftFailed(NegativeAmount));
+        Deposit => match account.apply_deposit(tx.amount) {
+            Ok(updated) => {
+                storage
+                    .update_account_for_withdrawal_or_deposit(tx, updated)
+                    .await?;
+                Ok(Applied)
             }
-            let updated = Account {
-                available: account.available + tx.amount,
-                total: account.total + tx.amount,
-                ..account
-            };
-            storage
-                .update_account_for_withdrawal_or_deposit(tx, updated)
-                .await?;
-            Ok(Applied)
-        }
+            Err(reason) => Ok(SoftFailed(reason)),
+        },
 
-        // Debit: decreases available and total. Rejected if it would overdraw.
-        Withdrawal => {
-            if tx.amount < Decimal::ZERO {
-                return Ok(SoftFailed(NegativeAmount));
+        Withdrawal => match account.apply_withdrawal(tx.amount) {
+            Ok(updated) => {
+                storage
+                    .update_account_for_withdrawal_or_deposit(tx, updated)
+                    .await?;
+                Ok(Applied)
             }
-            if account.available < tx.amount {
-                return Ok(SoftFailed(InsufficientFunds));
-            }
-            let updated = Account {
-                available: account.available - tx.amount,
-                total: account.total - tx.amount,
-                ..account
-            };
-            storage
-                .update_account_for_withdrawal_or_deposit(tx, updated)
-                .await?;
-            Ok(Applied)
-        }
+            Err(reason) => Ok(SoftFailed(reason)),
+        },
 
-        // Dispute opens a hold against an existing deposit, moving funds from
-        // available → held. Allowed even on locked accounts so chargeback
-        // lifecycles can be opened post-lock.
+        // Lifecycle events: validate the referenced tx (exists, owner matches,
+        // and for Dispute that it points at a Deposit), then delegate the
+        // arithmetic to `Account`.
         Dispute => {
             let Some(disputed_tx) = storage.find_transaction(tx.tx_id).await? else {
                 return Ok(SoftFailed(DisputedTransactionNotFound));
@@ -192,16 +180,11 @@ async fn process_transaction(
             if disputed_tx.tx_type != Deposit {
                 return Ok(SoftFailed(DisputeOnNonDeposit));
             }
-            let updated = Account {
-                available: account.available - disputed_tx.amount,
-                held: account.held + disputed_tx.amount,
-                ..account
-            };
+            let updated = account.apply_dispute(disputed_tx.amount);
             storage.update_account_for_dispute(tx, updated).await?;
             Ok(Applied)
         }
 
-        // Resolve releases held funds back to available; total unchanged.
         Resolve => {
             let Some(disputed_tx) = storage.find_disputed_transaction(tx.tx_id).await? else {
                 return Ok(SoftFailed(DisputedTransactionNotFound));
@@ -209,18 +192,11 @@ async fn process_transaction(
             if disputed_tx.client_id != tx.client_id {
                 return Ok(SoftFailed(ClientIdMismatch));
             }
-            let updated = Account {
-                available: account.available + disputed_tx.amount,
-                held: account.held - disputed_tx.amount,
-                ..account
-            };
+            let updated = account.apply_resolve(disputed_tx.amount);
             storage.update_account_for_resolve(tx, updated).await?;
             Ok(Applied)
         }
 
-        // Chargeback removes held funds from total and locks the account.
-        // A second chargeback for a tx_id no longer in the disputed map is
-        // surfaced as `DisputedTransactionNotFound`, not an error.
         Chargeback => {
             let Some(disputed_tx) = storage.find_disputed_transaction(tx.tx_id).await? else {
                 return Ok(SoftFailed(DisputedTransactionNotFound));
@@ -228,12 +204,7 @@ async fn process_transaction(
             if disputed_tx.client_id != tx.client_id {
                 return Ok(SoftFailed(ClientIdMismatch));
             }
-            let updated = Account {
-                held: account.held - disputed_tx.amount,
-                total: account.total - disputed_tx.amount,
-                locked: true,
-                ..account
-            };
+            let updated = account.apply_chargeback(disputed_tx.amount);
             storage.update_account_for_chargeback(tx, updated).await?;
             Ok(Applied)
         }
@@ -306,10 +277,9 @@ mod tests {
 
     use rust_decimal::Decimal;
 
-    use super::process_transaction;
-    use crate::ports::{
-        ProcessOutcome, ProcessorSoftFailures, SkipReason, Storage, Transaction, TxType,
-    };
+    use super::{process_transaction, ProcessOutcome};
+    use crate::domain::{ProcessorSoftFailures, Transaction, TxType};
+    use crate::ports::Storage;
     use crate::storage::local_memory::LocalMemoryStorage;
 
     fn make_tx(tx_type: TxType, client_id: u16, tx_id: u32, amount: f64) -> Transaction {
@@ -335,34 +305,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Deposit
+    // Deposit (orchestration only — pure arithmetic lives on `Account`)
     // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn deposit_increases_available_and_total() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-
-        let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, d(100.0));
-        assert_eq!(account.total, d(100.0));
-        assert_eq!(account.held, Decimal::ZERO);
-        assert!(!account.locked);
-    }
-
-    #[tokio::test]
-    async fn deposit_negative_amount_is_ignored() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        let outcome = run(&storage, make_tx(TxType::Deposit, 1, 1, -50.0)).await;
-        assert_eq!(
-            outcome,
-            ProcessOutcome::SoftFailed(ProcessorSoftFailures::NegativeAmount)
-        );
-
-        let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, Decimal::ZERO);
-        assert_eq!(account.total, Decimal::ZERO);
-    }
 
     #[tokio::test]
     async fn deposit_on_locked_account_still_increases_balance() {
@@ -383,90 +327,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Withdrawal
+    // Dispute (orchestration only — pure arithmetic lives on `Account`)
     // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn withdrawal_decreases_available_and_total() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-        run(&storage, make_tx(TxType::Withdrawal, 1, 2, 40.0)).await;
-
-        let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, d(60.0));
-        assert_eq!(account.total, d(60.0));
-        assert_eq!(account.held, Decimal::ZERO);
-    }
-
-    #[tokio::test]
-    async fn withdrawal_negative_amount_is_ignored() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-        let outcome = run(&storage, make_tx(TxType::Withdrawal, 1, 2, -10.0)).await;
-        assert_eq!(
-            outcome,
-            ProcessOutcome::SoftFailed(ProcessorSoftFailures::NegativeAmount)
-        );
-
-        let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, d(100.0));
-        assert_eq!(account.total, d(100.0));
-    }
-
-    #[tokio::test]
-    async fn withdrawal_with_insufficient_funds_is_ignored() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 50.0)).await;
-        let outcome = run(&storage, make_tx(TxType::Withdrawal, 1, 2, 100.0)).await;
-        assert_eq!(
-            outcome,
-            ProcessOutcome::SoftFailed(ProcessorSoftFailures::InsufficientFunds)
-        );
-
-        let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, d(50.0));
-        assert_eq!(account.total, d(50.0));
-    }
-
-    #[tokio::test]
-    async fn withdrawal_on_locked_account_is_ignored() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        // Two deposits so there are funds available after the chargeback removes one
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-        run(&storage, make_tx(TxType::Deposit, 1, 2, 200.0)).await;
-        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
-        run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
-
-        let before = storage.get_account(1).await.unwrap();
-        assert!(before.locked);
-
-        let outcome = run(&storage, make_tx(TxType::Withdrawal, 1, 3, 50.0)).await;
-        assert_eq!(
-            outcome,
-            ProcessOutcome::SoftFailed(ProcessorSoftFailures::AccountLocked)
-        );
-
-        let after = storage.get_account(1).await.unwrap();
-        assert_eq!(after.available, before.available);
-        assert_eq!(after.total, before.total);
-    }
-
-    // -------------------------------------------------------------------------
-    // Dispute
-    // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn dispute_moves_amount_from_available_to_held() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
-
-        let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, Decimal::ZERO);
-        assert_eq!(account.held, d(100.0));
-        assert_eq!(account.total, d(100.0));
-        assert!(!account.locked);
-    }
 
     #[tokio::test]
     async fn dispute_with_client_id_mismatch_is_ignored() {
@@ -529,22 +391,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Resolve
+    // Resolve (orchestration only — pure arithmetic lives on `Account`)
     // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn resolve_returns_held_funds_to_available() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
-        run(&storage, make_tx(TxType::Resolve, 1, 1, 0.0)).await;
-
-        let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, d(100.0));
-        assert_eq!(account.held, Decimal::ZERO);
-        assert_eq!(account.total, d(100.0));
-        assert!(!account.locked);
-    }
 
     #[tokio::test]
     async fn resolve_with_client_id_mismatch_is_ignored() {
@@ -591,22 +439,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Chargeback
+    // Chargeback (orchestration only — pure arithmetic lives on `Account`)
     // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn chargeback_removes_held_funds_and_locks_account() {
-        let storage = Arc::new(LocalMemoryStorage::new());
-        run(&storage, make_tx(TxType::Deposit, 1, 1, 100.0)).await;
-        run(&storage, make_tx(TxType::Dispute, 1, 1, 0.0)).await;
-        run(&storage, make_tx(TxType::Chargeback, 1, 1, 0.0)).await;
-
-        let account = storage.get_account(1).await.unwrap();
-        assert_eq!(account.available, Decimal::ZERO);
-        assert_eq!(account.held, Decimal::ZERO);
-        assert_eq!(account.total, Decimal::ZERO);
-        assert!(account.locked);
-    }
 
     #[tokio::test]
     async fn chargeback_with_client_id_mismatch_is_ignored() {

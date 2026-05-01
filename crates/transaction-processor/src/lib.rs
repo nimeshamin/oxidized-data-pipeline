@@ -7,11 +7,13 @@
 //! keyed by `u16`. Each channel drains into a worker that delegates to the
 //! configured `Storage` adapter.
 
+pub mod domain;
 pub mod ports;
 pub mod processor;
 pub mod sources;
 pub mod storage;
 
-pub use ports::{ProcessOutcome, ProcessorSoftFailures, Source, Storage, Transaction};
-pub use processor::{TransactionProcessor, TransactionProcessorBuilder};
+pub use domain::{Account, ProcessorSoftFailures, Transaction, TxType};
+pub use ports::{Source, Storage};
+pub use processor::{ProcessOutcome, TransactionProcessor, TransactionProcessorBuilder};
 pub use sources::route;

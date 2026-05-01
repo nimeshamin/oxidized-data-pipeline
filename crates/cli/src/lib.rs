@@ -66,7 +66,7 @@ fn output_csv_header() {
     println!("client,available,held,total,locked");
 }
 
-fn output_formatted_accounts(accounts: &[transaction_processor::ports::Account]) {
+fn output_formatted_accounts(accounts: &[transaction_processor::Account]) {
     for account in accounts {
         println!(
             "{},{},{},{},{}",

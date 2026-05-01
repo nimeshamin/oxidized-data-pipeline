@@ -4,10 +4,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
-use crate::{
-    ports::{Account, Storage, TransactionError, TxType},
-    Transaction,
-};
+use crate::domain::{Account, Transaction, TxType};
+use crate::ports::{Storage, TransactionError};
 
 /// A Transaction that is guaranteed to be a Deposit or Withdrawal.
 /// Lifecycle messages (Dispute/Resolve/Chargeback) are rejected.
@@ -39,14 +37,6 @@ pub struct LocalMemoryStorage {
 impl LocalMemoryStorage {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.accounts.lock().unwrap().len()
-    }
-
-    pub fn snapshot(&self) -> Vec<Account> {
-        self.accounts.lock().unwrap().values().cloned().collect()
     }
 
     pub fn update(&self, account: Account) {

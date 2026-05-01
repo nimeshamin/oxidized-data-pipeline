@@ -8,7 +8,8 @@ use serde::Deserialize;
 use tokio::fs::File;
 use tokio::sync::mpsc;
 
-use crate::ports::{Source, Transaction, TxType};
+use crate::domain::{Transaction, TxType};
+use crate::ports::Source;
 
 /// Separate CsvTransaction struct for deserialization, since the CSV may have different field
 /// names and types than the internal Transaction struct. This also prevents breaking changes to
