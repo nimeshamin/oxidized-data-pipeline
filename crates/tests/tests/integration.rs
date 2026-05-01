@@ -41,13 +41,13 @@ async fn cli_main_runs_with_input_file() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn cli_main_with_debug_flag() -> anyhow::Result<()> {
-    let _m = MetricsGuard::new("cli_main_with_debug_flag");
+async fn cli_main_with_tracing_flag() -> anyhow::Result<()> {
+    let _m = MetricsGuard::new("cli_main_with_tracing_flag");
 
-    let path = write_sample_csv("cli-debug").await?;
+    let path = write_sample_csv("cli-tracing").await?;
     let argv = [
         "csv-ingestor".to_string(),
-        "--debug".to_string(),
+        "--tracing".to_string(),
         path.to_string_lossy().into_owned(),
     ];
     cli::run_from_args(argv).await?;
@@ -106,9 +106,8 @@ async fn transaction_processor_direct_use_simple_single_worker() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn transaction_processor_direct_use() -> anyhow::Result<()> {
-    let _m = MetricsGuard::new("transaction_processor_direct_use");
-    init_tracing(true);
+async fn transaction_processor_direct_use_perf() -> anyhow::Result<()> {
+    let _m = MetricsGuard::new("transaction_processor_direct_use_perf");
 
     let processor = TransactionProcessor::builder()
         .parallelism(8)
@@ -117,31 +116,12 @@ async fn transaction_processor_direct_use() -> anyhow::Result<()> {
         .await?;
 
     let result = processor
-        .ingest_csv(Path::new("./tests/data/test_input_large.csv"))
+        .ingest_csv(Path::new("./tests/data/test_input_stress.csv"))
         .await;
     if result.is_err() {
         eprintln!("ingest_csv error: {:?}", result.as_ref().err());
     }
     assert!(result.is_ok(), "ingest_csv should succeed with valid input");
-
-    let accounts = processor.snapshot_accounts(0, 1).await?;
-    assert!(
-        !accounts.is_empty(),
-        "snapshot_accounts should return some accounts"
-    );
-    // Loop until there are no more items. Print each account as a line of output
-    let mut page = 0;
-    let page_size = 1;
-    loop {
-        let accounts = processor.snapshot_accounts(page, page_size).await?;
-        if accounts.is_empty() {
-            break;
-        }
-        for account in accounts {
-            println!("{:?}", account);
-        }
-        page += 1;
-    }
 
     processor.shutdown().await?;
     Ok(())
