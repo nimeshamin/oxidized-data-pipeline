@@ -24,6 +24,7 @@ csv-ingestor/
 ├── rust-toolchain.toml               # pinned to 1.95
 ├── .gitignore                        # Rust-specific
 ├── .vscode/launch.json               # debug configs (cli, integration tests, unit tests)
+└── scripts/                          # helper scripts for things like generating test data
 └── crates/
     ├── cli/                          # binary entry point
     │   ├── Cargo.toml
